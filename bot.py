@@ -48,7 +48,7 @@ PAPER_BALANCE     = 1000.0
 MIN_SIGNAL_CONF   = 0.25
 RSI_OVERSOLD      = 42
 RSI_OVERBOUGHT    = 58
-NET_SCORE_NEEDED  = 1
+NET_SCORE_NEEDED  = 0    # loosened: tie is enough in Extreme Fear markets
 RISK_PER_TRADE    = 0.08
 MAX_DAILY_LOSS    = 0.15
 MAX_DRAWDOWN      = 0.20
@@ -58,6 +58,9 @@ ML_WEIGHT         = 0.30
 TAKE_PROFIT_PCT   = 0.025   # scale-out: close 100% at +2.5% (or use ladder below)
 TRAIL_PCT         = 0.012   # trailing stop: 1.2% below rolling peak
 HARD_FLOOR_PCT    = 0.025   # absolute floor: never lose more than 2.5% from entry
+
+# ── Re-entry cooldown ────────────────────────────────────────────────────────
+REENTRY_COOLDOWN_SEC = 900   # 15 min cooldown after a trailing-stop or hard-floor exit
 
 # ── BTC filter ────────────────────────────────────────────────────────────────
 BTC_DROP_BLOCK    = -0.015  # block BUY if BTC dropped >1.5% in last hour
@@ -307,6 +310,75 @@ class BTCFilter:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# XRP/BTC RATIO SIGNAL
+# ══════════════════════════════════════════════════════════════════════════════
+
+class XRPBTCRatio:
+    """
+    Tracks the XRP/BTC price ratio over the last hour.
+    When XRP is rising faster than BTC  → bullish signal (XRP outperforming)
+    When XRP is falling faster than BTC → bearish signal (XRP underperforming)
+    This is one of the strongest XRP-specific signals since it filters out
+    pure BTC-driven moves and isolates XRP-native momentum.
+    """
+    def __init__(self):
+        self._history: list = []   # rolling list of (ts, ratio)
+        self._last_fetch = 0
+
+    def update(self, xrp_price: float) -> dict:
+        """Call once per loop with the current XRP price. Returns ratio signal."""
+        now = time.time()
+        if now - self._last_fetch < 55:
+            return self._status(xrp_price)
+
+        try:
+            r = requests.get(
+                f'{KRAKEN_BASE}/0/public/Ticker',
+                params={'pair': 'XBTUSD'}, timeout=8
+            )
+            data = r.json()
+            if data.get('result'):
+                key       = list(data['result'].keys())[0]
+                btc_price = float(data['result'][key]['c'][0])
+                if btc_price > 0 and xrp_price > 0:
+                    ratio = xrp_price / btc_price
+                    self._history.append((now, ratio))
+                    # Keep only last 65 minutes
+                    cutoff = now - 3900
+                    self._history = [(t, r) for t, r in self._history if t > cutoff]
+                self._last_fetch = now
+        except Exception as e:
+            log.debug(f"XRP/BTC ratio fetch error: {e}")
+
+        return self._status(xrp_price)
+
+    def _status(self, xrp_price: float) -> dict:
+        if len(self._history) < 2:
+            return {'signal': 0, 'momentum_1h': 0.0, 'reason': 'XRP/BTC: no data yet'}
+
+        now      = time.time()
+        current  = self._history[-1][1]
+        target   = now - 3600
+        old_candidates = [(t, r) for t, r in self._history if abs(t - target) < 300]
+        old_ratio = (min(old_candidates, key=lambda x: abs(x[0] - target))[1]
+                     if old_candidates else self._history[0][1])
+
+        momentum = (current - old_ratio) / old_ratio   # % change in the ratio
+
+        if momentum > 0.010:     # XRP up >1% relative to BTC
+            signal = 1
+            reason = f"XRP/BTC outperforming BTC {momentum*100:+.2f}%/1h (bullish)"
+        elif momentum < -0.010:  # XRP down >1% relative to BTC
+            signal = -1
+            reason = f"XRP/BTC underperforming BTC {momentum*100:+.2f}%/1h (bearish)"
+        else:
+            signal = 0
+            reason = f"XRP/BTC ratio neutral {momentum*100:+.2f}%/1h"
+
+        return {'signal': signal, 'momentum_1h': round(momentum, 4), 'reason': reason}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # VOLATILITY SIGNAL
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -439,12 +511,13 @@ def compute_indicators(df: pd.DataFrame) -> dict:
 
 def generate_signal(ind: dict, ticker: dict, ml: MLSignal,
                     sentiment: SentimentSignal, vol_signal: VolatilitySignal,
-                    btc_status: dict, fg_score: int) -> dict:
+                    btc_status: dict, fg_score: int,
+                    xrp_btc_ratio: dict | None = None) -> dict:
 
     bullish = 0
     bearish = 0
     reasons = []
-    total   = 9   # +1 for BTC/sentiment combined check
+    total   = 10   # added XRP/BTC ratio as vote #10
     pair    = ticker['pair']
     price   = ind['price']
     rsi     = ind['rsi']
@@ -507,9 +580,18 @@ def generate_signal(ind: dict, ticker: dict, ml: MLSignal,
     # ── 9. Volatility guard ───────────────────────────────────────────────────
     vol_score = vol_signal.get(ind)
     if vol_score > 0.75:
-        reasons.append(f"⚠ High vol ({vol_score:.2f}) — size reduced")
+        reasons.append(f"High vol ({vol_score:.2f}) — size reduced")
         bullish = max(0, bullish - 1)
         bearish = max(0, bearish - 1)
+
+    # ── 10. XRP/BTC Ratio — is XRP outperforming BTC? ────────────────────────
+    if xrp_btc_ratio:
+        xb_sig = xrp_btc_ratio.get('signal', 0)
+        reasons.append(xrp_btc_ratio.get('reason', ''))
+        if xb_sig == 1:
+            bullish += 1
+        elif xb_sig == -1:
+            bearish += 1
 
     # ── ML vote ───────────────────────────────────────────────────────────────
     ml_prob    = ml.predict(ind)
@@ -802,18 +884,20 @@ def main():
     log.info("  NaliBot v4  ·  Trailing Stop  ·  BTC Filter  ·  CryptoPanic")
     log.info("=" * 60)
 
-    ml        = MLSignal()
-    sentiment = SentimentSignal()
-    vol_sig   = VolatilitySignal()
-    btc_filt  = BTCFilter()
-    trader    = PaperTrader(PAPER_BALANCE)
-    guard     = RiskGuard(PAPER_BALANCE)
+    ml           = MLSignal()
+    sentiment    = SentimentSignal()
+    vol_sig      = VolatilitySignal()
+    btc_filt     = BTCFilter()
+    xrp_btc      = XRPBTCRatio()
+    trader       = PaperTrader(PAPER_BALANCE)
+    guard        = RiskGuard(PAPER_BALANCE)
 
-    last_hourly  = datetime.now()
-    last_day     = datetime.now().date()
-    loop         = 0
-    last_signals = {}
-    last_prices  = {}
+    last_hourly    = datetime.now()
+    last_day       = datetime.now().date()
+    loop           = 0
+    last_signals   = {}
+    last_prices    = {}
+    exit_cooldowns = {}   # pair → timestamp of last trailing-stop/hard-floor exit
 
     # Warm up Fear & Greed and BTC filter on start
     fg_score   = sentiment.fear_greed()
@@ -835,12 +919,28 @@ def main():
             log.info(f"\n{'─'*55}")
             log.info(f"Loop #{loop} | {datetime.now().strftime('%H:%M:%S')}")
 
-            # Daily reset
+            # Daily reset + auto-retrain ML model
             today = datetime.now().date()
             if today != last_day:
                 guard.new_day(trader.balance)
                 last_day = today
                 telegram(f"🌅 <b>New Day</b>\n{trader.summary()}")
+                log.info("  Daily retrain: running train_model.py ...")
+                try:
+                    import subprocess, sys
+                    train_script = os.path.join(os.path.dirname(__file__), 'train_model.py')
+                    result = subprocess.run(
+                        [sys.executable, '-X', 'utf8', train_script],
+                        capture_output=True, text=True, timeout=300
+                    )
+                    if result.returncode == 0:
+                        ml._load()   # hot-reload the new model
+                        log.info("  ML model retrained and reloaded.")
+                        telegram("Model retrained successfully.")
+                    else:
+                        log.warning(f"  Retrain failed: {result.stderr[-200:]}")
+                except Exception as e:
+                    log.warning(f"  Retrain error: {e}")
 
             if not guard.check(trader.balance):
                 save_state(trader, last_signals, last_prices, btc_status, fg_score)
@@ -864,6 +964,10 @@ def main():
                 exits = trader.check_exits(tickers)
                 for trade, reason in exits:
                     telegram(fmt_trade(trade))
+                    # Start cooldown for trail-stop and hard-floor exits
+                    if 'Trail' in reason or 'Hard floor' in reason:
+                        exit_cooldowns[trade['pair']] = time.time()
+                        log.info(f"  Cooldown started for {trade['pair']} ({REENTRY_COOLDOWN_SEC}s)")
                 if exits:
                     save_state(trader, last_signals, last_prices, btc_status, fg_score)
 
@@ -877,9 +981,18 @@ def main():
                 if not ticker:
                     continue
 
-                ind    = compute_indicators(df)
-                signal = generate_signal(ind, ticker, ml, sentiment,
-                                         vol_sig, btc_status, fg_score)
+                ind         = compute_indicators(df)
+                xrp_btc_sig = xrp_btc.update(ind['price'])
+                signal      = generate_signal(ind, ticker, ml, sentiment,
+                                              vol_sig, btc_status, fg_score,
+                                              xrp_btc_sig)
+
+                # Cooldown guard: suppress BUY if too soon after a trail/floor exit
+                cooldown_ts = exit_cooldowns.get(pair, 0)
+                if signal['action'] == 'BUY' and (time.time() - cooldown_ts) < REENTRY_COOLDOWN_SEC:
+                    remaining = int(REENTRY_COOLDOWN_SEC - (time.time() - cooldown_ts))
+                    log.info(f"  Cooldown active for {pair} — {remaining}s remaining, BUY suppressed")
+                    signal = dict(signal, action='HOLD')
 
                 last_prices[pair]  = {'price': ind['price'], 'rsi': ind['rsi'],
                                       'time': datetime.now().isoformat()}
