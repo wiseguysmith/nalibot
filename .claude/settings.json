@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python setup.py)",
+      "Bash(python start.py)",
+      "Bash(python -X utf8 bot.py)",
+      "Bash(python -X utf8 train_model.py)",
+      "Bash(python -X utf8 run_10_paper_trades.py)",
+      "Bash(npm install*)",
+      "Bash(node*)"
+    ]
+  }
+}
